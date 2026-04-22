@@ -1,8 +1,8 @@
 `timescale 1ns/1ps
 
 //////////////////////////////////////////////////////////////////////////////////
-// Company:         
-// Engineer:        
+// Company:  Sakon Semiconductors       
+// Engineer:    vinny mze        
 // 
 // Module Name:     cordic_rect_to_polar
 // Project:         WiFi HaLow
