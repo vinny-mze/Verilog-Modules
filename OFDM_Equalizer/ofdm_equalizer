@@ -1,0 +1,245 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 04/29/2026 10:35:14 AM
+// Design Name: 
+// Module Name: ofdm_equalizer
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+module ofdm_equalizer #(
+    parameter W            = 32,
+    parameter FRAC_W       = 14,
+    parameter ITER         = 4,
+    parameter MAX_HEST_LEN = 128,
+    parameter ADDR_W       = 7
+)(
+    input wire clk,
+    input wire rst,
+
+    input wire validIn,
+    input wire loadHest,
+
+    input wire [ADDR_W:0] hEstLen,
+
+    input wire signed [W-1:0] dataIn_re,
+    input wire signed [W-1:0] dataIn_im,
+
+    input wire signed [W-1:0] hEst_re,
+    input wire signed [W-1:0] hEst_im,
+
+    output reg signed [W-1:0] dataOut_re,
+    output reg signed [W-1:0] dataOut_im,
+    output reg validOut,
+
+    output wire input_ready
+);
+
+    // ------------------------------------------------------------
+    // RAM for stored channel estimates
+    // ------------------------------------------------------------
+    reg signed [W-1:0] hest_re_mem [0:MAX_HEST_LEN-1];
+    reg signed [W-1:0] hest_im_mem [0:MAX_HEST_LEN-1];
+
+    // ------------------------------------------------------------
+    // Subcarrier counter
+    // ------------------------------------------------------------
+    reg [ADDR_W-1:0] subcarrier_index;
+
+    // Active hEst length sampled at start of symbol
+    reg [ADDR_W:0] active_hEstLen;
+
+    // Indicates if RAM contains a valid stored channel estimate
+    reg have_stored_hEst;
+
+    // Store whether current symbol/sample is loading hEst
+    reg current_loadHest;
+
+    // ------------------------------------------------------------
+    // Selected values passed into the ZF core
+    // ------------------------------------------------------------
+    reg signed [W-1:0] selected_y_re;
+    reg signed [W-1:0] selected_y_im;
+    reg signed [W-1:0] selected_h_re;
+    reg signed [W-1:0] selected_h_im;
+
+    // ------------------------------------------------------------
+    // ZF core wires
+    // ------------------------------------------------------------
+    reg zf_valid_in;
+    wire zf_valid_out;
+
+    wire signed [W-1:0] zf_xhat_re;
+    wire signed [W-1:0] zf_xhat_im;
+
+    // ------------------------------------------------------------
+    // FSM states
+    // ------------------------------------------------------------
+    localparam IDLE      = 2'd0;
+    localparam START_ZF  = 2'd1;
+    localparam WAIT_ZF   = 2'd2;
+    localparam OUTPUT_ZF = 2'd3;
+
+    reg [1:0] state;
+
+    assign input_ready = (state == IDLE);
+
+    // ------------------------------------------------------------
+    // Single-subcarrier ZF equalizer
+    // ------------------------------------------------------------
+    zf_equalizer #(
+        .W(W),
+        .FRAC_W(FRAC_W),
+        .ITER(ITER)
+    ) zf_core (
+        .clk(clk),
+        .rst(rst),
+
+        .valid_in(zf_valid_in),
+
+        .y_re(selected_y_re),
+        .y_im(selected_y_im),
+        .h_re(selected_h_re),
+        .h_im(selected_h_im),
+
+        .xhat_re(zf_xhat_re),
+        .xhat_im(zf_xhat_im),
+        .valid_out(zf_valid_out)
+    );
+
+    // ------------------------------------------------------------
+    // Main FSM
+    // ------------------------------------------------------------
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= IDLE;
+
+            subcarrier_index <= 0;
+            active_hEstLen <= 0;
+            have_stored_hEst <= 0;
+            current_loadHest <= 0;
+
+            selected_y_re <= 0;
+            selected_y_im <= 0;
+            selected_h_re <= 0;
+            selected_h_im <= 0;
+
+            dataOut_re <= 0;
+            dataOut_im <= 0;
+            validOut <= 0;
+
+            zf_valid_in <= 0;
+        end else begin
+
+            validOut <= 0;
+            zf_valid_in <= 0;
+
+            case (state)
+
+                // ------------------------------------------------
+                // IDLE:
+                // Accept one input sample when validIn is high.
+                // ------------------------------------------------
+                IDLE: begin
+                    if (validIn) begin
+
+                        selected_y_re <= dataIn_re;
+                        selected_y_im <= dataIn_im;
+
+                        current_loadHest <= loadHest;
+
+                        // Sample hEstLen at the start of a symbol
+                        if (subcarrier_index == 0) begin
+                            active_hEstLen <= hEstLen;
+                        end
+
+                        if (loadHest) begin
+                            // Use current hEst
+                            selected_h_re <= hEst_re;
+                            selected_h_im <= hEst_im;
+
+                            // Store hEst for later symbols
+                            hest_re_mem[subcarrier_index] <= hEst_re;
+                            hest_im_mem[subcarrier_index] <= hEst_im;
+                        end else begin
+                            // Reuse stored hEst
+                            if (have_stored_hEst) begin
+                                selected_h_re <= hest_re_mem[subcarrier_index];
+                                selected_h_im <= hest_im_mem[subcarrier_index];
+                            end else begin
+                                // Fallback if no stored hEst exists yet
+                                selected_h_re <= hEst_re;
+                                selected_h_im <= hEst_im;
+                            end
+                        end
+
+                        state <= START_ZF;
+                    end
+                end
+
+                // ------------------------------------------------
+                // START_ZF:
+                // Pulse valid into the ZF core.
+                // ------------------------------------------------
+                START_ZF: begin
+                    zf_valid_in <= 1'b1;
+                    state <= WAIT_ZF;
+                end
+
+                // ------------------------------------------------
+                // WAIT_ZF:
+                // Wait for ZF core output.
+                // ------------------------------------------------
+                WAIT_ZF: begin
+                    if (zf_valid_out) begin
+                        state <= OUTPUT_ZF;
+                    end
+                end
+
+                // ------------------------------------------------
+                // OUTPUT_ZF:
+                // Output equalized result and update counter.
+                // ------------------------------------------------
+                OUTPUT_ZF: begin
+                    dataOut_re <= zf_xhat_re;
+                    dataOut_im <= zf_xhat_im;
+                    validOut <= 1'b1;
+
+                    if (active_hEstLen != 0) begin
+                        if (subcarrier_index == active_hEstLen - 1) begin
+                            subcarrier_index <= 0;
+
+                            if (current_loadHest) begin
+                                have_stored_hEst <= 1'b1;
+                            end
+                        end else begin
+                            subcarrier_index <= subcarrier_index + 1'b1;
+                        end
+                    end else begin
+                        subcarrier_index <= 0;
+                    end
+
+                    state <= IDLE;
+                end
+
+                default: begin
+                    state <= IDLE;
+                end
+
+            endcase
+        end
+    end
+
+endmodule
